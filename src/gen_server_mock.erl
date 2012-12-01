@@ -6,6 +6,9 @@
 %%%
 %%% Expectations get the same input as the handle_(whatever) gen_server methods. They should return -> ok | {ok, NewState}
 %%% Created     : 2009-08-05
+%%% Modified 2012-11-30 by Bill Barnhill <=bill.barnhill> to:
+%%%     .. Use inline eunit tests, as part of rebar-ification
+%%%     .. Cleaned up error output, added param to expect calls so that function form is displayed
 %%% Inspired by: http://erlang.org/pipermail/erlang-questions/2008-April/034140.html
 %%%-------------------------------------------------------------------
 
@@ -14,12 +17,16 @@
 
 % API
 -export([new/0, new/1, stop/1, crash/1,
-        expect/3, expect_call/2, expect_info/2, expect_cast/2,
+        expect/4, expect_call/3, expect_info/3, expect_cast/3,
         assert_expectations/1]).
 
 % gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
          code_change/3]).
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+-endif.
 
 %% Macros
 -define(SERVER, ?MODULE).
@@ -31,8 +38,11 @@
 
 -record(expectation, {
         type,
-        lambda
+        lambda,
+        lambda_data
 }).
+
+-ifndef(TEST).
 
 % steal assert from eunit
 -define(assert(BoolExpr),
@@ -49,6 +59,8 @@
                            end}]})
         end
       end)())).
+
+-endif.
 
 -define(raise(ErrorName),
     erlang:error({ErrorName,
@@ -116,8 +128,8 @@ new(N) when is_integer(N) -> % list() of Pids
 %% 
 %% Description: Set an expectation of Type
 %%--------------------------------------------------------------------
-expect(Mock, Type, Callback) ->
-    Exp = #expectation{type=Type, lambda=Callback},
+expect(Mock, Type, Callback, CallbackMeta) ->
+    Exp = #expectation{type=Type, lambda=Callback, lambda_data=CallbackMeta},
     added = gen_server:call(Mock, {expect, Exp}),
     ok.
 
@@ -129,8 +141,8 @@ expect(Mock, Type, Callback) ->
 %% 
 %% Description: Set a call expectation
 %%--------------------------------------------------------------------
-expect_call(Mock, Callback) ->
-    expect(Mock, call, Callback).
+expect_call(Mock, Callback, CallbackMeta) ->
+    expect(Mock, call, Callback, CallbackMeta).
 
 %%--------------------------------------------------------------------
 %% Function: expect_info(Mock, Callback) -> ok
@@ -140,8 +152,8 @@ expect_call(Mock, Callback) ->
 %% 
 %% Description: Set a info expectation
 %%--------------------------------------------------------------------
-expect_info(Mock, Callback) ->
-    expect(Mock, info, Callback).
+expect_info(Mock, Callback, CallbackMeta) ->
+    expect(Mock, info, Callback, CallbackMeta).
 
 %%--------------------------------------------------------------------
 %% Function: expect_cast(Mock, Callback) -> ok
@@ -151,8 +163,8 @@ expect_info(Mock, Callback) ->
 %% 
 %% Description: Set a cast expectation
 %%--------------------------------------------------------------------
-expect_cast(Mock, Callback) ->
-    expect(Mock, cast, Callback).
+expect_cast(Mock, Callback, CallbackMeta) ->
+    expect(Mock, cast, Callback, CallbackMeta).
 
 %%--------------------------------------------------------------------
 %% Function: assert_expectations(Mock)-> ok
@@ -162,10 +174,16 @@ expect_cast(Mock, Callback) ->
 assert_expectations(Mock) when is_pid(Mock) ->
     assert_expectations([Mock]);
 assert_expectations([H|T]) ->
-    gen_server:call(H, assert_expectations),
-    ok = assert_expectations(T);
+    case gen_server:call(H, assert_expectations) of
+        {error, unmet_gen_server_expectation, ExpLeft} -> 
+            erlang:error({unmet_expectations, ExpLeft});
+        ok -> assert_expectations(T)
+    end;
 assert_expectations([]) ->
     ok.
+
+        
+%?raise_info(unmet_gen_server_expectation, ExpLeft);
 
 %%--------------------------------------------------------------------
 %% Function: stop(Mock)-> ok
@@ -224,9 +242,14 @@ handle_call({expect, Expectation}, _From, State) ->
     {ok, NewState} = store_expectation(Expectation, State),
     {reply, added, NewState};
 
+handle_call(assert_expectations, _From, State=#state{expectations=ExpLeft}) when length(ExpLeft) > 0 ->
+    ExpData = lists:map(fun (#expectation{type=Type, lambda_data=FnData}) -> 
+                                {Type, FnData} 
+                        end, ExpLeft), 
+    {reply, {error, unmet_gen_server_expectation, ExpData}, State};
+
 handle_call(assert_expectations, _From, State) ->
-    {ok, NewState} = handle_assert_expectations(State),
-    {reply, ok, NewState};
+    {reply, ok, State};
 
 handle_call(Request, From, State) -> 
     {ok, Reply, NewState} = reply_with_next_expectation(call, Request, From, undef, undef, State),
@@ -295,14 +318,6 @@ pop_expectation(State) -> % {ok, Expectation, NewState}
     NewState = State#state{expectations = RestExpectations},
     {ok, Expectation, NewState}.
 
-handle_assert_expectations(State) -> % {ok, State}
-    ExpLeft = State#state.expectations,
-    case length(ExpLeft) > 0 of
-        true -> ?raise_info(unmet_gen_server_expectation, ExpLeft);
-        false -> ok
-    end,
-    {ok, State}.
-
 reply_with_next_expectation(Type, Request, From, Msg, Info, State) -> % -> {ok, Reply, NewState}
     {ok, Expectation, NewState} = pop_expectation(State),
     ?assert(Type =:= Expectation#expectation.type), % todo, have a useful error message, "expected this got that" 
@@ -330,3 +345,79 @@ call_expectation_lambda(Expectation, Type, Request, From, Msg, Info, State) -> %
         {ok, ResponseValue, NewState} -> {ok, ResponseValue, NewState};
         Other -> Other
     end.
+
+%% =============================================================
+%% Tests
+%% =============================================================
+
+-ifdef(TEST).
+
+-define(exit_error_name(Exception),
+    ((fun () ->
+    {{{ErrorName, _Info }, _Trace }, _MoreInfo} = Exception,
+    ErrorName
+    end)())).
+
+
+everything_working_normally_test_not_test() ->
+    {ok, Mock} = gen_server_mock:new(),    
+    gen_server_mock:expect(Mock, call, fun({foo, hi}, _From, _State) -> ok end, [{foo, hi}, '_', '_']),
+    gen_server_mock:expect_call(Mock, fun({bar, bye}, _From, _State) -> ok end, [{bar, bye}, '_', '_']),
+
+    ok = gen_server:call(Mock, {foo, hi}),  
+    ok = gen_server:call(Mock, {bar, bye}),  
+
+    ok = gen_server_mock:assert_expectations(Mock).
+
+
+
+missing_expectations_test_not_test() ->
+    {ok, Mock} = gen_server_mock:new(),
+    gen_server_mock:expect(Mock, call, fun({foo, hi}, _From, _State) -> ok end, [{foo, hi}, '_', '_']),
+    gen_server_mock:expect_call(Mock, fun({bar, bye}, _From, _State) -> ok end, [{bar, bye}, '_', '_']),
+
+    ok = gen_server:call(Mock, {foo, hi}),  
+
+    Result = try 
+                gen_server_mock:assert_expectations(Mock)
+            catch
+                error:Err -> Err
+            end,
+    ?assertEqual({unmet_expectations, [{call, [{bar, bye}, '_', '_']}]}, Result).
+
+unexpected_messages_test_not_test() ->
+    {ok, Mock} = gen_server_mock:new(),
+    gen_server_mock:expect_call(Mock, fun({bar, bye}, _From, _State) -> ok end, [{bar,bye}, '_', '_']),
+
+    unlink(Mock),
+    erlang:monitor(process,Mock),
+    gen_server:call(Mock, {foo, hi}),
+    Result = receive 
+                X -> X
+             end,
+    ?assertEqual(unexpected_request_made, Result).
+
+
+-ifdef(SKIP).
+special_return_values_test_() ->
+    {ok, Mock} = gen_server_mock:new(),
+    
+    gen_server_mock:expect_call(Mock, fun(one,  _From, _State)            -> ok end),
+    gen_server_mock:expect_call(Mock, fun(two,  _From,  State)            -> {ok, State} end),
+    gen_server_mock:expect_call(Mock, fun(three, _From,  State)           -> {ok, good, State} end),
+    gen_server_mock:expect_call(Mock, fun({echo, Response}, _From, State) -> {ok, Response, State} end),
+    gen_server_mock:expect_cast(Mock, fun(fish, State) -> {ok, State} end),
+    gen_server_mock:expect_info(Mock, fun(cat,  State) -> {ok, State} end),
+
+    ok = gen_server:call(Mock, one),
+    ok = gen_server:call(Mock, two),
+    good = gen_server:call(Mock, three),
+    tree = gen_server:call(Mock, {echo, tree}),
+    ok = gen_server:cast(Mock, fish),
+    Mock ! cat,
+
+    gen_server_mock:assert_expectations(Mock).
+-endif.
+
+-endif.
+

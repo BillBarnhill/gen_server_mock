@@ -1,0 +1,14 @@
+{application, gen_server_mock,
+ [
+  {description, ""},
+  {vsn, "1"},
+  {modules, [
+    gen_server_mock
+	]},
+  {registered, []},
+  {applications, [
+                  kernel,
+                  stdlib
+                 ]},
+  {env, []}
+ ]}.
